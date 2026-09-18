@@ -3,7 +3,7 @@ chcp 65001 >nul
 setlocal
 
 set "PYTHON_DIR=E:\ComfyUI\python"
-set "SCRIPT_FILE=%~dp0comfyui_dep_manager.py"
+set "SCRIPT_FILE=%~dp0CF-Dep-Manager.py"
 
 if not exist "%PYTHON_DIR%\python.exe" (
     echo [ERROR] Python not found: %PYTHON_DIR%\python.exe
@@ -14,15 +14,15 @@ if not exist "%PYTHON_DIR%\python.exe" (
 
 if not exist "%SCRIPT_FILE%" (
     echo [ERROR] Script not found: %SCRIPT_FILE%
-    echo Please keep launch.bat and comfyui_dep_manager.py in the same folder
+    echo Please keep launch.bat and CF-Dep-Manager.py in the same folder
     pause
     exit /b 1
 )
 
 echo ==============================================
-echo    ComfyUI Dep Manager
+echo    CF-Dep-Manager 启动中
 echo    URL: http://127.0.0.1:8186
-echo    Close this window to stop service
+echo    关闭此窗口即可停止服务
 echo ==============================================
 echo.
 

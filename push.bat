@@ -7,7 +7,7 @@ echo    ComfyUI 依赖管理器 自动推送脚本
 echo ==========================================
 
 :: GitHub 仓库地址（HTTPS 方式，无需配置 SSH）
-set REMOTE_URL=https://github.com/gnrsbassoutlook/ComfyUI-Dep-Manager.git
+set REMOTE_URL=https://github.com/gnrsbassoutlook/CF-Dep-Manager.git
 
 :: 检查是否已初始化 git
 if not exist ".git" (

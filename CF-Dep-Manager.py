@@ -2,6 +2,9 @@ import gradio as gr
 import subprocess
 import os
 import glob
+import json
+import re
+import configparser
 
 
 def get_python_exe(python_dir: str) -> str:
@@ -123,6 +126,148 @@ def scan_custom_requirements(custom_nodes_dir: str):
     return file_list, content_map
 
 
+def get_plugin_git_url(custom_nodes_dir: str, file_rel_path: str) -> str:
+    """提取单个插件的Git远程地址，自动转成网页可访问地址"""
+    plugin_dir_name = os.path.dirname(file_rel_path)
+    if not plugin_dir_name:
+        return ""
+    plugin_full_path = os.path.join(custom_nodes_dir, plugin_dir_name)
+    return extract_repo_url(plugin_full_path)
+
+
+def read_git_url_from_config(plugin_dir: str) -> str:
+    """直接解析 .git/config 文件读取远程地址，不依赖git命令"""
+    git_config = os.path.join(plugin_dir, ".git", "config")
+    if not os.path.isfile(git_config):
+        return ""
+    try:
+        config = configparser.ConfigParser()
+        config.read(git_config, encoding="utf-8")
+        if 'remote "origin"' in config:
+            url = config['remote "origin"'].get("url", "")
+            if url:
+                # SSH转HTTPS
+                if url.startswith("git@"):
+                    url = url.replace("git@github.com:", "https://github.com/")
+                if url.endswith(".git"):
+                    url = url[:-4]
+                return url.rstrip("/")
+    except:
+        pass
+    return ""
+
+
+def extract_repo_url(plugin_dir: str) -> str:
+    """
+    四重识别插件仓库地址：
+    1. manifest.json 中的 repository 字段（秋叶启动器标准）
+    2. __init__.py 中的仓库地址变量
+    3. 直接解析 .git/config 文件
+    4. 兜底调用 git 命令
+    """
+    if not os.path.isdir(plugin_dir):
+        return ""
+
+    # 1. 优先读 manifest.json（和秋叶启动器一致）
+    manifest_path = os.path.join(plugin_dir, "manifest.json")
+    if os.path.isfile(manifest_path):
+        try:
+            with open(manifest_path, "r", encoding="utf-8", errors="replace") as f:
+                data = json.load(f)
+            repo = data.get("repository", "")
+            # 兼容 repository 是字符串、对象、数组
+            if isinstance(repo, dict):
+                repo = repo.get("url", "")
+            elif isinstance(repo, list) and repo:
+                repo = repo[0]
+            if isinstance(repo, str) and repo.startswith("http"):
+                return repo.rstrip("/")
+        except:
+            pass
+
+    # 2. 读 __init__.py 中的常见仓库变量
+    init_path = os.path.join(plugin_dir, "__init__.py")
+    if os.path.isfile(init_path):
+        try:
+            with open(init_path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+            patterns = [
+                r'GITHUB_REPO\s*=\s*[\'"](.+?)[\'"]',
+                r'REPO_URL\s*=\s*[\'"](.+?)[\'"]',
+                r'__github__\s*=\s*[\'"](.+?)[\'"]',
+                r'github\.com/[^\s"\'<>]+'
+            ]
+            for pat in patterns:
+                match = re.search(pat, content, re.IGNORECASE)
+                if match:
+                    url = match.group(0) if pat.startswith(r'github') else match.group(1)
+                    if not url.startswith("http"):
+                        url = "https://" + url
+                    return url.rstrip("/")
+        except:
+            pass
+
+    # 3. 直接解析 .git/config（最稳定，不依赖git命令）
+    url = read_git_url_from_config(plugin_dir)
+    if url:
+        return url
+
+    # 4. 兜底：调用 git 命令
+    git_dir = os.path.join(plugin_dir, ".git")
+    if os.path.isdir(git_dir):
+        try:
+            result = subprocess.run(
+                ["git", "remote", "get-url", "origin"],
+                cwd=plugin_dir,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace"
+            )
+            url = result.stdout.strip()
+            if url.startswith("git@"):
+                url = url.replace("git@github.com:", "https://github.com/")
+            if url.endswith(".git"):
+                url = url[:-4]
+            if url:
+                return url.rstrip("/")
+        except:
+            pass
+
+    return ""
+
+
+def scan_all_plugin_git(custom_nodes_dir: str):
+    """扫描所有插件，返回：总插件数、带Git的数量、插件列表[(名称, 地址)]"""
+    if not os.path.isdir(custom_nodes_dir):
+        return 0, 0, []
+
+    total = 0
+    git_plugins = []
+
+    for item in sorted(os.listdir(custom_nodes_dir)):
+        item_path = os.path.join(custom_nodes_dir, item)
+        if not os.path.isdir(item_path):
+            continue
+        total += 1
+        
+        url = extract_repo_url(item_path)
+        if url:
+            git_plugins.append((item, url))
+
+    return total, len(git_plugins), git_plugins
+
+
+def build_git_links_md(plugin_list):
+    """生成带放大字体的链接列表Markdown"""
+    if not plugin_list:
+        return "*未找到匹配的插件*"
+    lines = []
+    for name, url in plugin_list:
+        lines.append(f'- <span style="font-size: 1.15em;">[{name}]({url}){{target=_blank}}</span>')
+    return "\n".join(lines)
+
+
 def find_package_in_plugins(pkg_name: str, content_map: dict):
     if isinstance(pkg_name, list):
         pkg_name = pkg_name[0] if pkg_name else ""
@@ -153,38 +298,48 @@ def find_package_in_plugins(pkg_name: str, content_map: dict):
 
 
 # ---------------------- 界面 ----------------------
-with gr.Blocks(title="ComfyUI 依赖管理器") as demo:
-    gr.Markdown("## ComfyUI 便携版依赖管理器")
+with gr.Blocks(title="CF-Dep-Manager") as demo:
+    gr.Markdown("## CF-Dep-Manager 依赖管理器")
 
+    # 顶部路径栏
     with gr.Row():
         python_path = gr.Textbox(label="Python 目录", value=r"E:\ComfyUI\python", scale=3)
         custom_nodes_path = gr.Textbox(label="插件目录", value=r"E:\ComfyUI\ComfyUI\custom_nodes", scale=3)
         refresh_btn = gr.Button("刷新全部", scale=1, variant="primary")
 
     with gr.Row():
-        # 左列：系统依赖 + 插件文件详情
+        # 左列：系统依赖 + 插件文件详情 + GitHub仓库一览
         with gr.Column(scale=2):
-            pip_output = gr.Textbox(label="系统依赖列表 (pip list)", lines=16, interactive=False)
-            export_btn = gr.Button("导出为 TXT")
+            pip_output = gr.Textbox(label="系统依赖列表 (pip list)", lines=14, interactive=False)
+            with gr.Row():
+                export_btn = gr.Button("导出为 TXT")
             export_file = gr.File(visible=False)
 
-            gr.Markdown("### 插件 requirements 文件详情")
+            gr.Markdown("#### 插件 requirements 文件详情")
             with gr.Row():
                 req_file_select = gr.Dropdown(
-                    label="选择文件查看完整内容",
+                    label="选择文件",
                     choices=[],
                     filterable=True,
                     allow_custom_value=True,
                     scale=3
                 )
-                scan_req_btn = gr.Button("重新扫描插件目录", scale=1)
-            req_content = gr.Textbox(label="文件内容", lines=12, interactive=False)
+                scan_req_btn = gr.Button("重新扫描", scale=1)
+            
+            plugin_git_link = gr.Markdown("")
+            req_content = gr.Textbox(label="文件内容", lines=10, interactive=False)
+
+            # 插件 GitHub 仓库一览
+            gr.Markdown("#### 插件 GitHub 仓库一览")
+            git_stats = gr.Markdown("")
+            plugin_search = gr.Textbox(label="搜索插件名称", placeholder="输入关键词过滤，如：layerstyle")
+            all_git_links = gr.Markdown("", height=400)
 
         # 右列：搜索操作 + 反向查询
         with gr.Column(scale=1):
-            gr.Markdown("### 依赖搜索与操作")
+            gr.Markdown("#### 依赖搜索与操作")
             pkg_select = gr.Dropdown(
-                label="选择/搜索依赖包（输入字母自动匹配）",
+                label="选择/搜索依赖包",
                 choices=[],
                 filterable=True,
                 allow_custom_value=True
@@ -196,11 +351,11 @@ with gr.Blocks(title="ComfyUI 依赖管理器") as demo:
                 install_btn = gr.Button("安装", variant="primary", scale=1)
                 uninstall_btn = gr.Button("卸载", variant="stop", scale=1)
 
-            exec_log = gr.Textbox(label="执行日志", lines=5, interactive=False)
+            exec_log = gr.Textbox(label="执行日志", lines=4, interactive=False)
 
-            gr.Markdown("### 插件反向查询")
+            gr.Markdown("#### 插件反向查询")
             plugin_file_select = gr.Dropdown(
-                label="包含该依赖的插件（点击查看完整内容）",
+                label="包含该依赖的插件",
                 choices=[],
                 filterable=True,
                 allow_custom_value=True
@@ -209,6 +364,7 @@ with gr.Blocks(title="ComfyUI 依赖管理器") as demo:
     # 状态存储
     pkg_dict_state = gr.State({})
     file_content_state = gr.State({})
+    all_git_plugins_state = gr.State([])
 
     # ---------------------- 事件 ----------------------
 
@@ -228,13 +384,21 @@ with gr.Blocks(title="ComfyUI 依赖管理器") as demo:
             req_files = []
             content_map = {"[error]": f"扫描插件目录失败：{e}"}
 
-        # 标准写法：用 gr.update 更新下拉框选项
+        # 扫描所有插件 GitHub 地址（四重识别）
+        total, git_count, git_plugins = scan_all_plugin_git(custom_dir)
+        stats_text = f"共 **{total}** 个插件，已关联 GitHub：**{git_count}** 个，未识别：**{total - git_count}** 个"
+        links_md = build_git_links_md(git_plugins)
+
         return (
             pip_text,
             pkg_dict,
-            gr.update(choices=pkg_list),   # 更新依赖包下拉选项
-            gr.update(choices=req_files),  # 更新插件文件下拉选项
-            content_map
+            gr.update(choices=pkg_list),
+            gr.update(choices=req_files),
+            content_map,
+            "",
+            stats_text,
+            git_plugins,
+            links_md
         )
 
     refresh_btn.click(
@@ -245,11 +409,29 @@ with gr.Blocks(title="ComfyUI 依赖管理器") as demo:
             pkg_dict_state,
             pkg_select,
             req_file_select,
-            file_content_state
+            file_content_state,
+            req_content,
+            git_stats,
+            all_git_plugins_state,
+            all_git_links
         ]
     )
 
-    # 选中依赖包 → 显示版本 + 更新反向查询下拉选项
+    # 插件名模糊搜索过滤
+    def filter_git_plugins(keyword, plugin_list):
+        if not keyword.strip():
+            return build_git_links_md(plugin_list)
+        kw = keyword.strip().lower()
+        filtered = [(n, u) for n, u in plugin_list if kw in n.lower()]
+        return build_git_links_md(filtered)
+
+    plugin_search.input(
+        fn=filter_git_plugins,
+        inputs=[plugin_search, all_git_plugins_state],
+        outputs=[all_git_links]
+    )
+
+    # 选中依赖包 → 显示版本 + 更新反向查询下拉
     def on_pkg_select(selected_pkg, pkg_dict, content_map):
         if isinstance(selected_pkg, list):
             selected_pkg = selected_pkg[0] if selected_pkg else ""
@@ -280,18 +462,25 @@ with gr.Blocks(title="ComfyUI 依赖管理器") as demo:
         outputs=[req_content]
     )
 
-    # 左侧文件选择 → 显示内容
-    def show_file_content(selected_file, content_map):
+    # 左侧选中文件 → 显示内容 + 显示GitHub跳转链接
+    def show_file_content(selected_file, custom_dir, content_map):
         if isinstance(selected_file, list):
             selected_file = selected_file[0] if selected_file else ""
         if not selected_file:
-            return ""
-        return content_map.get(selected_file, "")
+            return "", ""
+        
+        content = content_map.get(selected_file, "")
+        git_url = get_plugin_git_url(custom_dir, selected_file)
+        if git_url:
+            link_md = f"**🔗 插件 GitHub 主页：[{git_url}]({git_url}){{target=_blank}}**"
+        else:
+            link_md = "*未检测到 Git 仓库地址*"
+        return content, link_md
 
     req_file_select.change(
         fn=show_file_content,
-        inputs=[req_file_select, file_content_state],
-        outputs=[req_content]
+        inputs=[req_file_select, custom_nodes_path, file_content_state],
+        outputs=[req_content, plugin_git_link]
     )
 
     # 安装
@@ -323,15 +512,21 @@ with gr.Blocks(title="ComfyUI 依赖管理器") as demo:
     def rescan_plugins(custom_dir):
         try:
             req_files, content_map = scan_custom_requirements(custom_dir)
+            total, git_count, git_plugins = scan_all_plugin_git(custom_dir)
+            stats_text = f"共 **{total}** 个插件，已关联 GitHub：**{git_count}** 个，未识别：**{total - git_count}** 个"
+            links_md = build_git_links_md(git_plugins)
         except Exception as e:
             req_files = []
             content_map = {"[error]": f"扫描失败：{e}"}
-        return gr.update(choices=req_files), content_map
+            stats_text = "扫描失败"
+            git_plugins = []
+            links_md = ""
+        return gr.update(choices=req_files), content_map, stats_text, git_plugins, links_md
 
     scan_req_btn.click(
         fn=rescan_plugins,
         inputs=[custom_nodes_path],
-        outputs=[req_file_select, file_content_state]
+        outputs=[req_file_select, file_content_state, git_stats, all_git_plugins_state, all_git_links]
     )
 
 
