@@ -268,7 +268,61 @@ def build_git_links_md(plugin_list):
     return "\n".join(lines)
 
 
-def find_package_in_plugins(pkg_name: str, content_map: dict):
+# ---------------------- 版本冲突检测核心函数 ----------------------
+def parse_version(ver_str: str):
+    """解析版本号为数字元组，用于比较"""
+    try:
+        ver_str = ver_str.strip()
+        m = re.match(r'(\d+(?:\.\d+)*)', ver_str)
+        if not m:
+            return (0,)
+        return tuple(int(p) for p in m.group(1).split('.'))
+    except:
+        return (0,)
+
+
+def check_version_constraint(current_ver: str, constraint: str) -> bool:
+    """
+    检查当前版本是否满足约束条件
+    返回 True=满足  False=冲突
+    支持：== / >= / <= / > / < / ~= / !=
+    """
+    if not constraint or not current_ver or current_ver == "未安装":
+        return True
+    
+    current = parse_version(current_ver)
+    constraint = constraint.strip()
+    
+    match = re.match(r'(==|>=|<=|>|<|~=|!=)\s*(.+)', constraint)
+    if not match:
+        # 无符号默认按 >= 处理
+        op = '>='
+        ver = constraint
+    else:
+        op, ver = match.groups()
+    
+    target = parse_version(ver)
+    
+    if op == '==':
+        return current == target
+    elif op == '>=':
+        return current >= target
+    elif op == '<=':
+        return current <= target
+    elif op == '>':
+        return current > target
+    elif op == '<':
+        return current < target
+    elif op == '!=':
+        return current != target
+    elif op == '~=':
+        # ~= 兼容规则：~=1.2 表示 >=1.2 且 <2.0
+        return current >= target and current[0] == target[0]
+    else:
+        return True
+
+
+def find_package_in_plugins(pkg_name: str, content_map: dict, current_version: str = ""):
     if isinstance(pkg_name, list):
         pkg_name = pkg_name[0] if pkg_name else ""
     if not pkg_name.strip() or not content_map:
@@ -279,20 +333,33 @@ def find_package_in_plugins(pkg_name: str, content_map: dict):
 
     for file_path, content in content_map.items():
         ver_info = ""
+        constraint_str = ""
         for line in content.splitlines():
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
             name_part = line
+            # 提取包名和版本约束
             for sep in ["==", ">=", "<=", "~=", "!="]:
                 if sep in line:
-                    name_part = line.split(sep)[0]
+                    idx = line.find(sep)
+                    name_part = line[:idx]
+                    constraint_str = line[idx:]
                     break
+            else:
+                name_part = line
+                constraint_str = ""
+            
             if name_part.strip().lower() == pkg_lower:
                 ver_info = line.strip()
                 break
         if ver_info:
-            choices.append((f"{file_path}    {ver_info}", file_path))
+            display_text = f"{file_path}    {ver_info}"
+            # 版本冲突加 ⚠️ 前缀标识
+            if current_version and current_version != "未安装":
+                if not check_version_constraint(current_version, constraint_str):
+                    display_text = f"⚠️ 冲突  {display_text}"
+            choices.append((display_text, file_path))
 
     return choices
 
@@ -431,7 +498,7 @@ with gr.Blocks(title="CF-Dep-Manager") as demo:
         outputs=[all_git_links]
     )
 
-    # 选中依赖包 → 显示版本 + 更新反向查询下拉
+    # 选中依赖包 → 显示版本 + 更新反向查询下拉（带冲突标识）
     def on_pkg_select(selected_pkg, pkg_dict, content_map):
         if isinstance(selected_pkg, list):
             selected_pkg = selected_pkg[0] if selected_pkg else ""
@@ -439,7 +506,7 @@ with gr.Blocks(title="CF-Dep-Manager") as demo:
             return "", gr.update(choices=[])
         
         ver = pkg_dict.get(selected_pkg.lower(), "未安装")
-        plugin_choices = find_package_in_plugins(selected_pkg, content_map)
+        plugin_choices = find_package_in_plugins(selected_pkg, content_map, ver)
         return ver, gr.update(choices=plugin_choices)
 
     pkg_select.change(
