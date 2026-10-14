@@ -5,8 +5,76 @@ import glob
 import json
 import re
 import configparser
+import argparse
+
+# ---------------------- 路径与配置管理 ----------------------
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_FILE = os.path.join(CURRENT_DIR, "cdm_config.json")
+DEFAULT_PORT = 8186
 
 
+def load_saved_port() -> int:
+    """读取保存的端口配置，若无则使用默认端口 8186"""
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return int(data.get("port", DEFAULT_PORT))
+        except:
+            pass
+    return DEFAULT_PORT
+
+
+def save_and_sync_port(new_port) -> str:
+    """保存端口到 json，并同步修改同目录下的 launch_cdm.bat"""
+    try:
+        new_port = int(new_port)
+        if not (1024 <= new_port <= 65535):
+            return "❌ 端口范围应在 1024 ~ 65535 之间！"
+    except (ValueError, TypeError):
+        return "❌ 请输入有效的数字端口号！"
+
+    # 1. 保存到 cdm_config.json
+    try:
+        cfg = {}
+        if os.path.exists(CONFIG_FILE):
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+        cfg["port"] = new_port
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=4)
+    except Exception as e:
+        return f"❌ 写入配置文件失败: {str(e)}"
+
+    # 2. 同步修改同目录下的 bat 脚本 (launch_cdm.bat 或 launch.bat)
+    bat_synced = False
+    bat_candidates = ["launch_cdm.bat", "launch.bat"]
+    for bat_name in bat_candidates:
+        bat_path = os.path.join(CURRENT_DIR, bat_name)
+        if os.path.isfile(bat_path):
+            try:
+                with open(bat_path, "r", encoding="utf-8", errors="replace") as f:
+                    bat_content = f.read()
+
+                # 替换 set "PORT=xxxx" 或 http://127.0.0.1:xxxx
+                bat_content = re.sub(r'set\s+"PORT=\d+"', f'set "PORT={new_port}"', bat_content)
+                bat_content = re.sub(r'127\.0\.0\.1:\d+', f'127.0.0.1:{new_port}', bat_content)
+
+                with open(bat_path, "w", encoding="utf-8") as f:
+                    f.write(bat_content)
+                bat_synced = True
+            except Exception as e:
+                return f"⚠️ 端口已记录，但同步修改 {bat_name} 失败: {str(e)}"
+
+    bat_msg = "✅ `launch_cdm.bat` 已同步修改！" if bat_synced else "ℹ️ 未在同级目录找到 bat 文件（已仅保存配置）。"
+    return (
+        f"🎉 **端口已成功修改为 `{new_port}`！**\n\n"
+        f"{bat_msg}\n\n"
+        f"⚠️ **请关闭当前命令终端黑窗口，重新双击运行 `launch_cdm.bat` 重启生效！**"
+    )
+
+
+# ---------------------- 核心业务函数 ----------------------
 def get_python_exe(python_dir: str) -> str:
     return os.path.join(python_dir.strip(), "python.exe")
 
@@ -127,7 +195,6 @@ def scan_custom_requirements(custom_nodes_dir: str):
 
 
 def get_plugin_git_url(custom_nodes_dir: str, file_rel_path: str) -> str:
-    """提取单个插件的Git远程地址，自动转成网页可访问地址"""
     plugin_dir_name = os.path.dirname(file_rel_path)
     if not plugin_dir_name:
         return ""
@@ -136,7 +203,6 @@ def get_plugin_git_url(custom_nodes_dir: str, file_rel_path: str) -> str:
 
 
 def read_git_url_from_config(plugin_dir: str) -> str:
-    """直接解析 .git/config 文件读取远程地址，不依赖git命令"""
     git_config = os.path.join(plugin_dir, ".git", "config")
     if not os.path.isfile(git_config):
         return ""
@@ -146,7 +212,6 @@ def read_git_url_from_config(plugin_dir: str) -> str:
         if 'remote "origin"' in config:
             url = config['remote "origin"'].get("url", "")
             if url:
-                # SSH转HTTPS
                 if url.startswith("git@"):
                     url = url.replace("git@github.com:", "https://github.com/")
                 if url.endswith(".git"):
@@ -158,24 +223,15 @@ def read_git_url_from_config(plugin_dir: str) -> str:
 
 
 def extract_repo_url(plugin_dir: str) -> str:
-    """
-    四重识别插件仓库地址：
-    1. manifest.json 中的 repository 字段（秋叶启动器标准）
-    2. __init__.py 中的仓库地址变量
-    3. 直接解析 .git/config 文件
-    4. 兜底调用 git 命令
-    """
     if not os.path.isdir(plugin_dir):
         return ""
 
-    # 1. 优先读 manifest.json（和秋叶启动器一致）
     manifest_path = os.path.join(plugin_dir, "manifest.json")
     if os.path.isfile(manifest_path):
         try:
             with open(manifest_path, "r", encoding="utf-8", errors="replace") as f:
                 data = json.load(f)
             repo = data.get("repository", "")
-            # 兼容 repository 是字符串、对象、数组
             if isinstance(repo, dict):
                 repo = repo.get("url", "")
             elif isinstance(repo, list) and repo:
@@ -185,7 +241,6 @@ def extract_repo_url(plugin_dir: str) -> str:
         except:
             pass
 
-    # 2. 读 __init__.py 中的常见仓库变量
     init_path = os.path.join(plugin_dir, "__init__.py")
     if os.path.isfile(init_path):
         try:
@@ -207,12 +262,10 @@ def extract_repo_url(plugin_dir: str) -> str:
         except:
             pass
 
-    # 3. 直接解析 .git/config（最稳定，不依赖git命令）
     url = read_git_url_from_config(plugin_dir)
     if url:
         return url
 
-    # 4. 兜底：调用 git 命令
     git_dir = os.path.join(plugin_dir, ".git")
     if os.path.isdir(git_dir):
         try:
@@ -238,7 +291,6 @@ def extract_repo_url(plugin_dir: str) -> str:
 
 
 def scan_all_plugin_git(custom_nodes_dir: str):
-    """扫描所有插件，返回：总插件数、带Git的数量、插件列表[(名称, 地址)]"""
     if not os.path.isdir(custom_nodes_dir):
         return 0, 0, []
 
@@ -259,7 +311,6 @@ def scan_all_plugin_git(custom_nodes_dir: str):
 
 
 def build_git_links_md(plugin_list):
-    """生成带放大字体的链接列表Markdown"""
     if not plugin_list:
         return "*未找到匹配的插件*"
     lines = []
@@ -268,9 +319,7 @@ def build_git_links_md(plugin_list):
     return "\n".join(lines)
 
 
-# ---------------------- 版本冲突检测核心函数 ----------------------
 def parse_version(ver_str: str):
-    """解析版本号为数字元组，用于比较"""
     try:
         ver_str = ver_str.strip()
         m = re.match(r'(\d+(?:\.\d+)*)', ver_str)
@@ -282,11 +331,6 @@ def parse_version(ver_str: str):
 
 
 def check_version_constraint(current_ver: str, constraint: str) -> bool:
-    """
-    检查当前版本是否满足约束条件
-    返回 True=满足  False=冲突
-    支持：== / >= / <= / > / < / ~= / !=
-    """
     if not constraint or not current_ver or current_ver == "未安装":
         return True
     
@@ -295,7 +339,6 @@ def check_version_constraint(current_ver: str, constraint: str) -> bool:
     
     match = re.match(r'(==|>=|<=|>|<|~=|!=)\s*(.+)', constraint)
     if not match:
-        # 无符号默认按 >= 处理
         op = '>='
         ver = constraint
     else:
@@ -316,7 +359,6 @@ def check_version_constraint(current_ver: str, constraint: str) -> bool:
     elif op == '!=':
         return current != target
     elif op == '~=':
-        # ~= 兼容规则：~=1.2 表示 >=1.2 且 <2.0
         return current >= target and current[0] == target[0]
     else:
         return True
@@ -339,7 +381,6 @@ def find_package_in_plugins(pkg_name: str, content_map: dict, current_version: s
             if not line or line.startswith("#"):
                 continue
             name_part = line
-            # 提取包名和版本约束
             for sep in ["==", ">=", "<=", "~=", "!="]:
                 if sep in line:
                     idx = line.find(sep)
@@ -355,7 +396,6 @@ def find_package_in_plugins(pkg_name: str, content_map: dict, current_version: s
                 break
         if ver_info:
             display_text = f"{file_path}    {ver_info}"
-            # 版本冲突加 ⚠️ 前缀标识
             if current_version and current_version != "未安装":
                 if not check_version_constraint(current_version, constraint_str):
                     display_text = f"⚠️ 冲突  {display_text}"
@@ -364,18 +404,31 @@ def find_package_in_plugins(pkg_name: str, content_map: dict, current_version: s
     return choices
 
 
-# ---------------------- 界面 ----------------------
+# ---------------------- 界面构建 ----------------------
+CURRENT_PORT = load_saved_port()
+
 with gr.Blocks(title="CF-Dep-Manager") as demo:
     gr.Markdown("## CF-Dep-Manager 依赖管理器")
 
-    # 顶部路径栏
+    # 顶部配置栏与折叠端口管理
     with gr.Row():
-        python_path = gr.Textbox(label="Python 目录", value=r"E:\ComfyUI\python", scale=3)
-        custom_nodes_path = gr.Textbox(label="插件目录", value=r"E:\ComfyUI\ComfyUI\custom_nodes", scale=3)
+        python_path = gr.Textbox(label="Python 目录", value=r"E:\ComfyUI\python", scale=4)
+        custom_nodes_path = gr.Textbox(label="插件目录", value=r"E:\ComfyUI\ComfyUI\custom_nodes", scale=4)
         refresh_btn = gr.Button("刷新全部", scale=1, variant="primary")
 
+    with gr.Accordion("⚙️ 服务与端口设置", open=False):
+        with gr.Row():
+            port_input = gr.Number(
+                label="服务端口号 (Port)",
+                value=CURRENT_PORT,
+                precision=0,
+                scale=2
+            )
+            save_port_btn = gr.Button("保存新端口并同步更新 bat", variant="secondary", scale=2)
+        port_sync_result = gr.Markdown("")
+
     with gr.Row():
-        # 左列：系统依赖 + 插件文件详情 + GitHub仓库一览
+        # 左列
         with gr.Column(scale=2):
             pip_output = gr.Textbox(label="系统依赖列表 (pip list)", lines=14, interactive=False)
             with gr.Row():
@@ -396,13 +449,12 @@ with gr.Blocks(title="CF-Dep-Manager") as demo:
             plugin_git_link = gr.Markdown("")
             req_content = gr.Textbox(label="文件内容", lines=10, interactive=False)
 
-            # 插件 GitHub 仓库一览
             gr.Markdown("#### 插件 GitHub 仓库一览")
             git_stats = gr.Markdown("")
             plugin_search = gr.Textbox(label="搜索插件名称", placeholder="输入关键词过滤，如：layerstyle")
             all_git_links = gr.Markdown("", height=400)
 
-        # 右列：搜索操作 + 反向查询
+        # 右列
         with gr.Column(scale=1):
             gr.Markdown("#### 依赖搜索与操作")
             pkg_select = gr.Dropdown(
@@ -433,10 +485,16 @@ with gr.Blocks(title="CF-Dep-Manager") as demo:
     file_content_state = gr.State({})
     all_git_plugins_state = gr.State([])
 
-    # ---------------------- 事件 ----------------------
+    # ---------------------- 事件绑定 ----------------------
+
+    # 保存端口事件
+    save_port_btn.click(
+        fn=save_and_sync_port,
+        inputs=[port_input],
+        outputs=[port_sync_result]
+    )
 
     def refresh_all(py_dir, custom_dir):
-        # 获取系统依赖
         try:
             pip_text, pkg_dict, pkg_list = get_pip_list(py_dir)
         except Exception as e:
@@ -444,14 +502,12 @@ with gr.Blocks(title="CF-Dep-Manager") as demo:
             pkg_dict = {}
             pkg_list = []
 
-        # 扫描插件
         try:
             req_files, content_map = scan_custom_requirements(custom_dir)
         except Exception as e:
             req_files = []
             content_map = {"[error]": f"扫描插件目录失败：{e}"}
 
-        # 扫描所有插件 GitHub 地址（四重识别）
         total, git_count, git_plugins = scan_all_plugin_git(custom_dir)
         stats_text = f"共 **{total}** 个插件，已关联 GitHub：**{git_count}** 个，未识别：**{total - git_count}** 个"
         links_md = build_git_links_md(git_plugins)
@@ -484,7 +540,6 @@ with gr.Blocks(title="CF-Dep-Manager") as demo:
         ]
     )
 
-    # 插件名模糊搜索过滤
     def filter_git_plugins(keyword, plugin_list):
         if not keyword.strip():
             return build_git_links_md(plugin_list)
@@ -498,7 +553,6 @@ with gr.Blocks(title="CF-Dep-Manager") as demo:
         outputs=[all_git_links]
     )
 
-    # 选中依赖包 → 显示版本 + 更新反向查询下拉（带冲突标识）
     def on_pkg_select(selected_pkg, pkg_dict, content_map):
         if isinstance(selected_pkg, list):
             selected_pkg = selected_pkg[0] if selected_pkg else ""
@@ -515,7 +569,6 @@ with gr.Blocks(title="CF-Dep-Manager") as demo:
         outputs=[pkg_version, plugin_file_select]
     )
 
-    # 反向查询选中文件 → 直接显示内容
     def on_plugin_file_select(selected_file, content_map):
         if isinstance(selected_file, list):
             selected_file = selected_file[0] if selected_file else ""
@@ -529,7 +582,6 @@ with gr.Blocks(title="CF-Dep-Manager") as demo:
         outputs=[req_content]
     )
 
-    # 左侧选中文件 → 显示内容 + 显示GitHub跳转链接
     def show_file_content(selected_file, custom_dir, content_map):
         if isinstance(selected_file, list):
             selected_file = selected_file[0] if selected_file else ""
@@ -550,21 +602,18 @@ with gr.Blocks(title="CF-Dep-Manager") as demo:
         outputs=[req_content, plugin_git_link]
     )
 
-    # 安装
     install_btn.click(
         fn=install_package,
         inputs=[python_path, pkg_select, no_deps_check],
         outputs=[exec_log]
     )
 
-    # 卸载
     uninstall_btn.click(
         fn=uninstall_package,
         inputs=[python_path, pkg_select],
         outputs=[exec_log]
     )
 
-    # 导出
     def export_txt(pip_text):
         if not pip_text or not pip_text.strip():
             return gr.update(visible=False)
@@ -575,7 +624,6 @@ with gr.Blocks(title="CF-Dep-Manager") as demo:
 
     export_btn.click(fn=export_txt, inputs=[pip_output], outputs=[export_file])
 
-    # 重新扫描插件
     def rescan_plugins(custom_dir):
         try:
             req_files, content_map = scan_custom_requirements(custom_dir)
@@ -598,8 +646,15 @@ with gr.Blocks(title="CF-Dep-Manager") as demo:
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="CF-Dep-Manager")
+    parser.add_argument("--port", type=int, default=CURRENT_PORT, help="Server port")
+    args = parser.parse_args()
+
+    actual_port = args.port
+    print(f"[*] CF-Dep-Manager 正在启动，端口: {actual_port}")
+
     demo.launch(
         server_name="127.0.0.1",
-        server_port=8186,
+        server_port=actual_port,
         inbrowser=True
     )
